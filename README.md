@@ -459,17 +459,9 @@ If you use EchoRL in your research, please cite our paper:
 @article{echo_rl_2025,
   title={EchoRL: Learning to Plan through Experience for Efficient Reinforcement Learning},
   author={Anonymous Author},
-  journal={AISTATS},
   year={2025}
 }
 ```
-
-## Acknowledgments
-
-- Inspired by the "Era of Experience" perspective (Silver & Sutton, 2025)
-- Built on biological intelligence principles (Wu, 2025)
-- Leverages advances in large language models and reinforcement learning
-- Special thanks to the open-source community
 
 ---
 
