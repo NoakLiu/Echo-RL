@@ -471,13 +471,6 @@ If you use EchoRL in your research, please cite our paper:
 - Leverages advances in large language models and reinforcement learning
 - Special thanks to the open-source community
 
-## Support
-
-- **Documentation**: [EchoRL Docs](https://echo-rl.readthedocs.io)
-- **Issues**: [GitHub Issues](https://github.com/your-org/Echo-RL/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-org/Echo-RL/discussions)
-- **Email**: echo-rl@your-org.com
-
 ---
 
 **Made with love by the EchoRL Team**
