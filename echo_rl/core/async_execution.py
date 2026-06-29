@@ -25,10 +25,12 @@ import threading
 
 from ..kernels import (
     attention_bandwidth_cost,
+    effective_bandwidth_cost,
     prefix_match,
     schedule_priorities,
     state_hash,
 )
+from .bandwidth import BandwidthAwareScheduler, BandwidthConfig
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +79,11 @@ class ExecutionConfig:
     latency_weight: float = 0.1
     reward_weight: float = 1.0
     timeout: float = 30.0  # seconds per rollout
-    schedule_epsilon: float = 1e-6  # ε in priority(i) = r_i / (q_i + ε)
+    schedule_epsilon: float = 1e-6  # ε in priority(i) = r_i / (b_i + q_i + ε)
     bandwidth_scale: float = 1.0  # scale for b(s_{1:t})
+    enable_bandwidth_scheduling: bool = True
+    bandwidth_weight: float = 1.0
+    queue_weight: float = 1.0
 
 class KVCacheManager:
     """
@@ -266,9 +271,10 @@ class KVCacheManager:
 
 class LatencyScheduler:
     """
-    Reward-to-latency scheduler for async rollouts.
+    Bandwidth-aware scheduler for async rollouts.
 
-    priority(i) = r_i / (q_i + ε)
+    priority(i) = r_i / (w_b * b_eff(s_{1:t}) + w_q * q_i + ε)
+    Falls back to latency-only scheduling when bandwidth scheduling is disabled.
     """
 
     def __init__(self, config: ExecutionConfig):
@@ -277,16 +283,40 @@ class LatencyScheduler:
         self.request_times = {}
         self.estimated_times = {}
         self._lock = threading.RLock()
+        self.bandwidth_scheduler = BandwidthAwareScheduler(
+            BandwidthConfig(
+                attention_scale=config.bandwidth_scale,
+                schedule_epsilon=config.schedule_epsilon,
+                bandwidth_weight=config.bandwidth_weight,
+                queue_weight=config.queue_weight,
+                enable_bandwidth_scheduling=config.enable_bandwidth_scheduling,
+            )
+        )
 
-    def add_request(self, request: RolloutRequest):
+    def add_request(
+        self,
+        request: RolloutRequest,
+        seq_len: Optional[int] = None,
+        reuse_len: int = 0,
+    ):
         with self._lock:
             queue_time = len(self.priority_queue) * 0.1
-            rewards = np.array([request.priority], dtype=np.float32)
-            queue_times = np.array([queue_time], dtype=np.float32)
-            priority_arr = schedule_priorities(
-                rewards, queue_times, self.config.schedule_epsilon
-            )
-            priority = float(priority_arr[0])
+            seq_len = seq_len or int(request.state_sequence.shape[0])
+
+            if self.config.enable_bandwidth_scheduling:
+                priority = self.bandwidth_scheduler.compute_priority(
+                    reward=request.priority,
+                    seq_len=seq_len,
+                    queue_time=queue_time,
+                    reuse_len=reuse_len,
+                )
+            else:
+                rewards = np.array([request.priority], dtype=np.float32)
+                queue_times = np.array([queue_time], dtype=np.float32)
+                priority_arr = schedule_priorities(
+                    rewards, queue_times, self.config.schedule_epsilon
+                )
+                priority = float(priority_arr[0])
 
             self.request_times[request.request_id] = time.time()
             heapq.heappush(self.priority_queue, (-priority, request))
@@ -343,6 +373,8 @@ class AsyncExecutionEngine:
         self.total_tokens_generated = 0
         self.total_execution_time = 0.0
         self.total_bandwidth_cost = 0.0
+        self.total_effective_bandwidth_cost = 0.0
+        self.total_bandwidth_saved = 0.0
         self.rollout_count = 0
         
         # Thread safety
@@ -372,9 +404,15 @@ class AsyncExecutionEngine:
             timestamp=time.time(),
             metadata=metadata or {}
         )
-        
-        # Add to scheduler
-        self.scheduler.add_request(request)
+
+        seq_len = int(state_sequence.shape[0])
+        reuse_len = 0
+        prefix_result = self.kv_cache_manager.find_longest_prefix(state_sequence)
+        if prefix_result is not None:
+            _, reuse_len = prefix_result
+
+        # Add to bandwidth-aware scheduler
+        self.scheduler.add_request(request, seq_len=seq_len, reuse_len=reuse_len)
         
         # Start async execution
         future = self.executor.submit(self._execute_rollout, request)
@@ -421,7 +459,11 @@ class AsyncExecutionEngine:
             
             tokens_generated = self._generate_tokens(kv_states, request.state_sequence)
             seq_len = int(request.state_sequence.shape[0])
-            bandwidth_cost = attention_bandwidth_cost(seq_len, self.config.bandwidth_scale)
+            full_bandwidth = attention_bandwidth_cost(seq_len, self.config.bandwidth_scale)
+            bandwidth_cost = effective_bandwidth_cost(
+                seq_len, reuse_length, self.config.bandwidth_scale
+            )
+            bandwidth_saved = max(0.0, full_bandwidth - bandwidth_cost)
 
             execution_time = time.time() - start_time
 
@@ -435,6 +477,8 @@ class AsyncExecutionEngine:
                     "reuse_length": reuse_length,
                     "cache_hit": cached_kv is not None,
                     "bandwidth_cost": bandwidth_cost,
+                    "full_bandwidth_cost": full_bandwidth,
+                    "bandwidth_saved": bandwidth_saved,
                     **request.metadata,
                 },
             )
@@ -456,7 +500,11 @@ class AsyncExecutionEngine:
             self.total_execution_time += execution_time
             if result.success:
                 self.total_tokens_generated += result.tokens_generated
-                self.total_bandwidth_cost += result.metadata.get("bandwidth_cost", 0.0)
+                self.total_bandwidth_cost += result.metadata.get("full_bandwidth_cost", 0.0)
+                self.total_effective_bandwidth_cost += result.metadata.get(
+                    "bandwidth_cost", 0.0
+                )
+                self.total_bandwidth_saved += result.metadata.get("bandwidth_saved", 0.0)
             
             # Move from active to completed
             if request.request_id in self.active_rollouts:
@@ -554,6 +602,8 @@ class AsyncExecutionEngine:
                 "total_tokens_generated": self.total_tokens_generated,
                 "total_execution_time": self.total_execution_time,
                 "total_bandwidth_cost": self.total_bandwidth_cost,
+                "total_effective_bandwidth_cost": self.total_effective_bandwidth_cost,
+                "total_bandwidth_saved": self.total_bandwidth_saved,
                 "avg_execution_time": avg_execution_time,
                 "tokens_per_second": tokens_per_second,
                 "cache_stats": cache_stats,

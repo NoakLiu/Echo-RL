@@ -26,7 +26,7 @@ from ..core.latent_planning import LatentPlanningOptimizer, PlanningConfig, Traj
 from ..core.async_execution import AsyncExecutionEngine, ExecutionConfig, RolloutRequest
 from ..core.prioritized_replay import PrioritizedReplayBuffer, ReplayConfig, Experience
 from ..core.ppo_learner import PPOLearner, PPOConfig, PPOTrainingStep
-from ..core.bandwidth import BandwidthEfficiencyTracker
+from ..core.bandwidth import BandwidthConfig, BandwidthEfficiencyTracker
 from ..environments.base import EchoRLEnvironment, EnvironmentState
 
 logger = logging.getLogger(__name__)
@@ -56,6 +56,7 @@ class TrainingConfig:
     execution_config: ExecutionConfig = field(default_factory=ExecutionConfig)
     replay_config: ReplayConfig = field(default_factory=ReplayConfig)
     ppo_config: PPOConfig = field(default_factory=PPOConfig)
+    bandwidth_config: BandwidthConfig = field(default_factory=BandwidthConfig)
     
     # Training settings
     device: str = "cuda"
@@ -139,7 +140,9 @@ class EchoRLTrainer:
         self.state_history: deque = deque(maxlen=64)
 
         # Bandwidth efficiency tracker (η_bw)
-        self.bandwidth_tracker = BandwidthEfficiencyTracker()
+        self.bandwidth_tracker = BandwidthEfficiencyTracker(
+            config=self.config.bandwidth_config
+        )
         
         logger.info("EchoRL Trainer initialized successfully")
     
@@ -355,8 +358,11 @@ class EchoRLTrainer:
             )
             
             trajectory.append(experience)
+            reuse_len = max(0, len(self.state_history) - 1)
             self.bandwidth_tracker.record_rollout_step(
-                next_state.reward, seq_len=len(self.state_history) + 1
+                next_state.reward,
+                seq_len=len(self.state_history) + 1,
+                reuse_len=reuse_len,
             )
             self.state_history.append(state)
 

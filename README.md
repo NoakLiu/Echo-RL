@@ -1,19 +1,20 @@
-# EchoRL: Learning to Plan through Experience for Efficient Reinforcement Learning
+# EchoRL: Learning to Plan through Experience for Bandwidth-Efficient Reinforcement Learning
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-**EchoRL** is a system framework that bridges reaction and planning in real-time reinforcement learning through experience-grounded infrastructure. It introduces three key innovations for efficient LLM-based reinforcement learning:
+**EchoRL** is a system framework that bridges reaction and planning in real-time reinforcement learning through experience-grounded infrastructure. It introduces three key innovations for **bandwidth-efficient** LLM-based reinforcement learning:
 
 1. **Latent Planning Optimization** - structured rollout with continuation-based reasoning
-2. **Asynchronous Execution Engine** - KV-cache sharing and token-level dispatch  
+2. **Asynchronous Execution Engine** - KV-cache sharing, bandwidth-aware scheduling, and token-level dispatch  
 3. **Prioritized Replay Buffer** - stratified hot/cold buffers for improved RL training efficiency
 
 ## Key Features
 
 - **Latent Planning**: Trajectory-conditioned policy with KL regularization
-- **Async Execution**: KV-cache sharing with 78% reuse rate and latency-aware scheduling
+- **Bandwidth-Efficient Execution**: KV-cache sharing with effective bandwidth b_eff(s_{1:t}) and η_bw tracking
+- **Async Execution**: 78% KV reuse rate with bandwidth-aware priority scheduling
 - **Prioritized Replay**: Hot/cold buffer stratification with surprise-weighted sampling
 - **Comprehensive Evaluation**: Benchmarks across ALFWorld, WebShop, CRUXEval, ARC, and MiniGrid
 - **Multi-Backbone Support**: GPT-4o, Claude-3.5-Sonnet, Gemini-1.5-Pro, Llama-4, Qwen, DeepSeek-R1
@@ -135,8 +136,23 @@ EchoRL coordinates three modules through one shared latent plan τ̄:
 Latent Plan τ_t = F_φ(s_{t-k:t})
         │
         ├──► Soft-prefix policy π_θ(a_t | s_t, τ_t)
-        ├──► KV-aware async rollout scheduling: priority = r / (q + ε)
+        ├──► Bandwidth-aware scheduling: priority = r / (b_eff + q + ε)
         └──► Planning-aware replay: score = ||τ_t - τ̄||² + α|r_t|
+```
+
+### Bandwidth Efficiency
+
+EchoRL optimizes the bandwidth efficiency metric:
+
+```
+η_bw(π) = E[Σ r_t] / (E[Σ b_eff(s_{1:t})] + E_B[w|ℓ_PG|])
+```
+
+where effective rollout bandwidth accounts for KV prefix reuse:
+
+```
+b_eff(s_{1:t}, t') = b(s_{1:t}) - b(s_{1:t'})   # t' = reused prefix length
+b(s_{1:t}) = scale · t(t+1)/2                     # quadratic attention cost
 ```
 
 ### C++ Performance Kernels
@@ -150,6 +166,8 @@ Performance-critical paths are implemented in C++ (`echo_rl/kernels/`) with Pyth
 | `prefix_match` | KV prefix reuse: KV(s₁:t) = KV_frozen ∪ KV_rolling |
 | `priority_sample` | Softmax replay sampling + importance weights |
 | `attention_bandwidth_cost` | Rollout bandwidth b(s₁:t) |
+| `effective_bandwidth_cost` | KV-aware effective bandwidth b_eff(s₁:t) |
+| `bandwidth_aware_priorities` | Scheduling priority r / (b + q + ε) |
 | `bandwidth_efficiency` | η_bw learning return per bandwidth unit |
 
 Build kernels:
@@ -161,6 +179,31 @@ python -c "from echo_rl.kernels import kernels_available; print(kernels_availabl
 ```
 
 EchoRL consists of three core components:
+
+### 4. Bandwidth-Efficient Scheduling
+
+```python
+from echo_rl.core.bandwidth import (
+    BandwidthConfig,
+    BandwidthEfficiencyTracker,
+    BandwidthAwareScheduler,
+)
+from echo_rl.kernels import effective_bandwidth_cost, bandwidth_efficiency
+
+# Effective bandwidth with KV prefix reuse
+b_eff = effective_bandwidth_cost(seq_len=128, reuse_len=96, scale=1.0)
+
+# Bandwidth-aware rollout scheduling
+scheduler = BandwidthAwareScheduler(BandwidthConfig(bandwidth_weight=1.0))
+priority = scheduler.compute_priority(reward=1.0, seq_len=128, queue_time=0.5, reuse_len=96)
+
+# Track η_bw during training
+tracker = BandwidthEfficiencyTracker()
+tracker.record_rollout_step(reward=0.5, seq_len=64, reuse_len=48)
+tracker.record_learner_update(weighted_pg_loss=0.02)
+metrics = tracker.snapshot()
+print(f"η_bw = {metrics.eta_bw:.4f}, saved = {metrics.total_bandwidth_saved:.2f}")
+```
 
 ### 1. Latent Planning Optimization
 
@@ -391,6 +434,7 @@ ppo_config = PPOConfig(
 - [`latent_planning_demo.py`](examples/latent_planning_demo.py) - Trajectory encoding demo
 - [`async_execution_demo.py`](examples/async_execution_demo.py) - KV-cache sharing demo
 - [`prioritized_replay_demo.py`](examples/prioritized_replay_demo.py) - Hot/cold buffer demo
+- [`bandwidth_efficient_demo.py`](examples/bandwidth_efficient_demo.py) - Bandwidth efficiency demo
 
 ## Testing
 

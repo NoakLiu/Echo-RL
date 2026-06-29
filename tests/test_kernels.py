@@ -88,6 +88,26 @@ def test_bandwidth_efficiency():
     assert eta == 1.0
 
 
+def test_effective_bandwidth_cost():
+    from echo_rl.kernels import effective_bandwidth_cost
+
+    assert effective_bandwidth_cost(0, 0) == 0.0
+    full = effective_bandwidth_cost(3, 0)
+    assert full == 6.0
+    partial = effective_bandwidth_cost(3, 2)
+    assert partial == 3.0  # 6 - 3
+
+
+def test_bandwidth_aware_priorities_kernel():
+    from echo_rl.kernels import bandwidth_aware_priorities
+
+    rewards = np.array([2.0, 1.0], dtype=np.float32)
+    bandwidth = np.array([4.0, 2.0], dtype=np.float32)
+    queue = np.array([1.0, 1.0], dtype=np.float32)
+    priorities = bandwidth_aware_priorities(rewards, bandwidth, queue)
+    assert priorities[0] == priorities[1]  # 2/(4+1) == 1/(2+1)
+
+
 def test_state_hash_deterministic():
     vec = np.array([1.0, 2.0, 3.0], dtype=np.float32)
     assert state_hash(vec) == state_hash(vec)

@@ -25,7 +25,9 @@ try:
         EMAPlanTracker as _CEMAPlanTracker,
         compute_attention_bandwidth_cost,
         compute_attention_bandwidth_cost_batch,
+        compute_bandwidth_aware_priorities,
         compute_bandwidth_efficiency,
+        compute_effective_bandwidth_cost,
         compute_plan_surprise,
         compute_plan_surprise_batch,
         compute_schedule_priorities,
@@ -131,6 +133,33 @@ def attention_bandwidth_cost_batch(seq_lengths: np.ndarray, scale: float = 1.0) 
     return np.array(
         [attention_bandwidth_cost(int(s), scale) for s in seq_lengths], dtype=np.float32
     )
+
+
+def effective_bandwidth_cost(seq_len: int, reuse_len: int = 0, scale: float = 1.0) -> float:
+    """Bandwidth cost after KV prefix reuse: b(s_{1:t}) - b(s_{1:t'})."""
+    if _KERNELS_AVAILABLE:
+        return float(compute_effective_bandwidth_cost(seq_len, reuse_len, scale))
+    full = attention_bandwidth_cost(seq_len, scale)
+    prefix = attention_bandwidth_cost(reuse_len, scale)
+    return max(0.0, full - prefix)
+
+
+def bandwidth_aware_priorities(
+    rewards: np.ndarray,
+    bandwidth_costs: np.ndarray,
+    queue_times: np.ndarray,
+    epsilon: float = 1e-6,
+) -> np.ndarray:
+    """priority(i) = reward / (bandwidth + queue_time + epsilon)."""
+    rewards = np.asarray(rewards, dtype=np.float32)
+    bandwidth_costs = np.asarray(bandwidth_costs, dtype=np.float32)
+    queue_times = np.asarray(queue_times, dtype=np.float32)
+    if _KERNELS_AVAILABLE:
+        return compute_bandwidth_aware_priorities(
+            rewards, bandwidth_costs, queue_times, epsilon
+        )
+    denom = bandwidth_costs + queue_times + epsilon
+    return rewards / denom
 
 
 def schedule_priorities(
@@ -242,7 +271,9 @@ __all__ = [
     "EMAPlanTracker",
     "attention_bandwidth_cost",
     "attention_bandwidth_cost_batch",
+    "bandwidth_aware_priorities",
     "bandwidth_efficiency",
+    "effective_bandwidth_cost",
     "kernels_available",
     "plan_surprise",
     "plan_surprise_batch",

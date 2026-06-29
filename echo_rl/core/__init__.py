@@ -11,7 +11,12 @@ from .latent_planning import LatentPlanningOptimizer, TrajectoryEncoder, SoftPre
 from .async_execution import AsyncExecutionEngine, KVCacheManager, LatencyScheduler
 from .prioritized_replay import PrioritizedReplayBuffer, HotColdBuffer, SurpriseCalculator
 from .ppo_learner import PPOLearner, GAECalculator, PolicyNetwork
-from .bandwidth import BandwidthEfficiencyTracker, BandwidthMetrics
+from .bandwidth import (
+    BandwidthAwareScheduler,
+    BandwidthConfig,
+    BandwidthEfficiencyTracker,
+    BandwidthMetrics,
+)
 
 __all__ = [
     "LatentPlanningOptimizer",
@@ -28,4 +33,6 @@ __all__ = [
     "PolicyNetwork",
     "BandwidthEfficiencyTracker",
     "BandwidthMetrics",
+    "BandwidthConfig",
+    "BandwidthAwareScheduler",
 ]
