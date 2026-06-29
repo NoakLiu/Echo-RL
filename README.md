@@ -27,9 +27,6 @@
 - [Examples](#examples)
 - [Benchmarking](#benchmarking)
 - [API Reference](#api-reference)
-- [Contributing](#contributing)
-- [Citation](#citation)
-
 ## Installation
 
 ### Prerequisites
@@ -446,60 +443,6 @@ config = BenchmarkConfig(
 )
 ```
 
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
-
-### Development Setup
-
-```bash
-# Install development dependencies
-pip install -r requirements.txt
-pip install -e .
-
-# Install pre-commit hooks
-pre-commit install
-
-# Run code formatting
-black echo_rl/
-flake8 echo_rl/
-
-# Run type checking
-mypy echo_rl/
-```
-
-### Adding New Tasks
-
-1. Create environment interface in `echo_rl/environments/`
-2. Implement `EchoRLEnvironment` abstract methods
-3. Add configuration dataclass
-4. Update task registry in `echo_rl/training/trainer.py`
-
-### Adding New Backbones
-
-1. Implement LLM interface in `echo_rl/models/`
-2. Add to model factory in `echo_rl/models/llm_interface.py`
-3. Update configuration options
-4. Add to benchmark configurations
-
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Citation
-
-If you use EchoRL in your research, please cite our paper:
-
-```bibtex
-@article{echo_rl_2025,
-  title={EchoRL: Learning to Plan through Experience for Efficient Reinforcement Learning},
-  author={Anonymous Author},
-  year={2025}
-}
-```
-
----
-
-**Made with love by the EchoRL Team**
-
-*Bridging reaction and planning through experience-grounded infrastructure*

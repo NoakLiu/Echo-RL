@@ -115,6 +115,28 @@ void compute_schedule_priorities(
     }
 }
 
+float compute_effective_bandwidth_cost(int seq_len, int reuse_len, float scale) {
+    if (seq_len <= 0) {
+        return 0.0f;
+    }
+    reuse_len = std::max(0, std::min(reuse_len, seq_len));
+    const float full = compute_attention_bandwidth_cost(seq_len, scale);
+    const float prefix = compute_attention_bandwidth_cost(reuse_len, scale);
+    return std::max(0.0f, full - prefix);
+}
+
+void compute_bandwidth_aware_priorities(
+    const float* rewards,
+    const float* bandwidth_costs,
+    const float* queue_times,
+    int batch_size,
+    float epsilon,
+    float* out_priorities) {
+    for (int i = 0; i < batch_size; ++i) {
+        out_priorities[i] = rewards[i] / (bandwidth_costs[i] + queue_times[i] + epsilon);
+    }
+}
+
 uint64_t hash_state_vector(const float* data, int dim) {
     uint64_t hash = FNV_OFFSET;
     hash = fnv1a_update(hash, data, static_cast<size_t>(dim) * sizeof(float));

@@ -116,6 +116,38 @@ PYBIND11_MODULE(_echo_kernels, m) {
               return out;
           });
 
+    m.def("compute_effective_bandwidth_cost",
+          &echo_rl::compute_effective_bandwidth_cost,
+          py::arg("seq_len"),
+          py::arg("reuse_len"),
+          py::arg("scale") = 1.0f);
+
+    m.def("compute_bandwidth_aware_priorities",
+          [](py::array_t<float> rewards,
+             py::array_t<float> bandwidth_costs,
+             py::array_t<float> queue_times,
+             float epsilon) {
+              auto r = rewards.request();
+              auto b = bandwidth_costs.request();
+              auto q = queue_times.request();
+              if (r.size != b.size || r.size != q.size) {
+                  throw std::runtime_error(
+                      "rewards, bandwidth_costs, and queue_times must have same length");
+              }
+              const int n = static_cast<int>(r.size);
+              py::array_t<float> out(n);
+              auto out_buf = out.mutable_unchecked<1>();
+              echo_rl::compute_bandwidth_aware_priorities(
+                  static_cast<const float*>(r.ptr),
+                  static_cast<const float*>(b.ptr),
+                  static_cast<const float*>(q.ptr),
+                  n,
+                  epsilon,
+                  out_buf.mutable_data(0)
+              );
+              return out;
+          });
+
     m.def("hash_state_vector", [](py::array_t<float> data) {
         auto buf = data.request();
         if (buf.ndim != 1) {

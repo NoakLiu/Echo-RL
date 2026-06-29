@@ -65,6 +65,24 @@ void compute_schedule_priorities(
     float* out_priorities
 );
 
+// Effective bandwidth with KV prefix reuse:
+// b_eff(s_{1:t}, t') = b(s_{1:t}) - b(s_{1:t'})
+float compute_effective_bandwidth_cost(
+    int seq_len,
+    int reuse_len,
+    float scale = 1.0f
+);
+
+// Bandwidth-aware scheduling: priority(i) = reward / (bandwidth + queue_time + epsilon)
+void compute_bandwidth_aware_priorities(
+    const float* rewards,
+    const float* bandwidth_costs,
+    const float* queue_times,
+    int batch_size,
+    float epsilon,
+    float* out_priorities
+);
+
 // Longest prefix match against cached sequence hashes
 struct PrefixMatchResult {
     int cache_index;
