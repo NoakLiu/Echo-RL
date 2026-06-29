@@ -254,6 +254,13 @@ class HotColdBuffer:
 
             hot_samples = int(batch_size * hot_ratio)
             cold_samples = batch_size - hot_samples
+
+            if not self.cold_buffer:
+                hot_samples = batch_size
+                cold_samples = 0
+            elif not self.hot_buffer:
+                hot_samples = 0
+                cold_samples = batch_size
             
             # Sample from hot buffer
             hot_experiences, hot_weights = self._sample_from_buffer(
