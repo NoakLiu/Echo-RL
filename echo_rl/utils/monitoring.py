@@ -51,6 +51,8 @@ class PerformanceMetrics:
     replay_buffer_size: int = 0
     hot_buffer_hit_rate: float = 0.0
     cold_buffer_hit_rate: float = 0.0
+    bandwidth_efficiency: float = 0.0  # η_bw
+    rollout_bandwidth_cost: float = 0.0
     
     # Timing metrics
     rollout_time: float = 0.0
@@ -346,6 +348,8 @@ class PerformanceMonitor:
             replay_buffer_size=echo_rl_metrics.get("replay_buffer_size", 0),
             hot_buffer_hit_rate=echo_rl_metrics.get("hot_buffer_hit_rate", 0.0),
             cold_buffer_hit_rate=echo_rl_metrics.get("cold_buffer_hit_rate", 0.0),
+            bandwidth_efficiency=echo_rl_metrics.get("bandwidth_efficiency", 0.0),
+            rollout_bandwidth_cost=echo_rl_metrics.get("rollout_bandwidth_cost", 0.0),
             rollout_time=echo_rl_metrics.get("rollout_time", 0.0),
             training_time=echo_rl_metrics.get("training_time", 0.0),
             total_time=current_time - self.start_time
@@ -393,6 +397,10 @@ class PerformanceMonitor:
         if "tokens_per_second" in recent_summary:
             tps_summary = recent_summary["tokens_per_second"]
             logger.info(f"Tokens/sec: {tps_summary['mean']:.1f} ± {tps_summary['std']:.1f}")
+
+        if "bandwidth_efficiency" in recent_summary:
+            bw_summary = recent_summary["bandwidth_efficiency"]
+            logger.info(f"η_bw: {bw_summary['mean']:.4f} ± {bw_summary['std']:.4f}")
         
         if "cpu_usage" in system_summary:
             cpu_summary = system_summary["cpu_usage"]

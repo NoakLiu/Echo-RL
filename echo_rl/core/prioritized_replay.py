@@ -20,7 +20,8 @@ import heapq
 import time
 import logging
 import threading
-from abc import ABC, abstractmethod
+
+from ..kernels import EMAPlanTracker, plan_surprise, priority_sample
 
 logger = logging.getLogger(__name__)
 
@@ -40,91 +41,65 @@ class Experience:
 
 @dataclass
 class ReplayConfig:
-    """Configuration for prioritized replay buffer"""
+    """Configuration for planning-aware prioritized replay buffer"""
     hot_buffer_size: int = 1000000  # |B_hot|
     cold_buffer_size: int = 10000000  # |B_cold|
     age_threshold: int = 1000  # τ_thresh - threshold for hot/cold separation
+    max_replay_age: int = 100000  # bounded replay age (paper)
     temperature: float = 1.0  # β - temperature for softmax sampling
-    surprise_weight: float = 1.0  # α - weight for surprise metric
-    reward_weight: float = 1.0  # Weight for reward component
+    surprise_weight: float = 1.0  # weight for ||τ_t - τ̄||²
+    reward_weight: float = 1.0  # weight for reward component
+    ema_decay: float = 0.99  # decay for EMA plan τ̄
     min_experiences: int = 1000  # Minimum experiences before sampling
     max_experiences: int = 11000000  # Total buffer capacity
     priority_alpha: float = 0.6  # Priority exponent
     importance_sampling_beta: float = 0.4  # Importance sampling correction
+    hot_sample_ratio: float = 0.7  # fraction of batch from hot buffer
 
 class SurpriseCalculator:
     """
-    Computes trajectory surprise metrics for experience prioritization
-    
-    Implements: score(t) = ||τ_t - E[τ]||² + α * r_t
+    Computes plan surprise relative to EMA plan τ̄.
+
+    score(t) = ||τ_t - τ̄||² + α * |r_t|
     """
-    
-    def __init__(self, config: ReplayConfig):
+
+    def __init__(self, config: ReplayConfig, latent_dim: int = 512):
         self.config = config
-        
-        # Running statistics for surprise calculation
-        self.trajectory_mean = None
-        self.trajectory_variance = None
-        self.trajectory_count = 0
-        
-        # Thread safety
+        self.latent_dim = latent_dim
+        self.ema_tracker = EMAPlanTracker(latent_dim, decay=config.ema_decay)
         self._lock = threading.RLock()
-    
-    def update_statistics(self, latent_plan: torch.Tensor):
-        """
-        Update running statistics for trajectory surprise calculation
-        
-        Args:
-            latent_plan: [embedding_dim] - latent trajectory plan
-        """
+
+    def update_ema_plan(self, latent_plan: torch.Tensor):
+        """Update EMA plan τ̄ with new latent trajectory prior."""
         with self._lock:
-            if self.trajectory_mean is None:
-                # Initialize with first trajectory
-                self.trajectory_mean = latent_plan.clone()
-                self.trajectory_variance = torch.zeros_like(latent_plan)
-                self.trajectory_count = 1
-            else:
-                # Update running statistics using Welford's algorithm
-                self.trajectory_count += 1
-                delta = latent_plan - self.trajectory_mean
-                self.trajectory_mean += delta / self.trajectory_count
-                delta2 = latent_plan - self.trajectory_mean
-                self.trajectory_variance += delta * delta2
-    
-    def compute_surprise_score(self, 
-                              latent_plan: torch.Tensor, 
+            plan_np = latent_plan.detach().cpu().numpy().reshape(-1)
+            self.ema_tracker.update(plan_np)
+
+    def compute_surprise_score(self,
+                              latent_plan: torch.Tensor,
                               reward: float) -> float:
-        """
-        Compute surprise score for trajectory prioritization
-        
-        Args:
-            latent_plan: [embedding_dim] - latent trajectory plan
-            reward: Reward value
-            
-        Returns:
-            surprise_score: Surprise score for prioritization
-        """
         with self._lock:
-            if self.trajectory_mean is None:
-                # No statistics available yet, use simple reward-based score
+            plan_np = latent_plan.detach().cpu().numpy().reshape(-1)
+            ema_np = self.ema_tracker.get_ema()
+            if not self.ema_tracker.initialized:
                 return abs(reward) * self.config.reward_weight
-            
-            # Compute distance from expected trajectory
-            trajectory_distance = torch.norm(latent_plan - self.trajectory_mean).item()
-            
-            # Combine with reward
-            surprise_score = (trajectory_distance * self.config.surprise_weight + 
-                            abs(reward) * self.config.reward_weight)
-            
-            return surprise_score
-    
+            return plan_surprise(
+                plan_np,
+                ema_np,
+                reward,
+                self.config.surprise_weight,
+                self.config.reward_weight,
+            )
+
+    def get_ema_plan(self) -> np.ndarray:
+        return self.ema_tracker.get_ema()
+
     def get_statistics(self) -> Dict[str, Any]:
-        """Get current trajectory statistics"""
         with self._lock:
+            ema = self.ema_tracker.get_ema()
             return {
-                "trajectory_count": self.trajectory_count,
-                "trajectory_mean_norm": torch.norm(self.trajectory_mean).item() if self.trajectory_mean is not None else 0.0,
-                "trajectory_variance_norm": torch.norm(self.trajectory_variance).item() if self.trajectory_variance is not None else 0.0
+                "ema_initialized": self.ema_tracker.initialized,
+                "ema_plan_norm": float(np.linalg.norm(ema)),
             }
 
 class HotColdBuffer:
@@ -206,46 +181,77 @@ class HotColdBuffer:
         
         self.hot_buffer.pop()
     
+    def migrate_aged_experiences(self):
+        """Move hot-buffer experiences past age threshold into cold buffer."""
+        with self._lock:
+            remaining_hot = []
+            remaining_priorities = []
+
+            for exp in self.hot_buffer:
+                if exp.age > self.config.age_threshold:
+                    self.cold_buffer.append(exp)
+                    priority = exp.priority ** self.config.priority_alpha
+                    heapq.heappush(self.cold_priorities, (-priority, len(self.cold_buffer) - 1))
+                    if len(self.cold_buffer) > self.config.cold_buffer_size:
+                        self._evict_cold_experience()
+                else:
+                    remaining_hot.append(exp)
+
+            self.hot_buffer = remaining_hot
+            self.hot_priorities = []
+            for idx, exp in enumerate(self.hot_buffer):
+                priority = exp.priority ** self.config.priority_alpha
+                heapq.heappush(self.hot_priorities, (-priority, idx))
+
+    def evict_stale_experiences(self):
+        """Remove experiences exceeding bounded replay age."""
+        with self._lock:
+            self.hot_buffer = [
+                e for e in self.hot_buffer if e.age <= self.config.max_replay_age
+            ]
+            self.cold_buffer = [
+                e for e in self.cold_buffer if e.age <= self.config.max_replay_age
+            ]
+            self.hot_priorities = []
+            self.cold_priorities = []
+            for idx, exp in enumerate(self.hot_buffer):
+                priority = exp.priority ** self.config.priority_alpha
+                heapq.heappush(self.hot_priorities, (-priority, idx))
+            for idx, exp in enumerate(self.cold_buffer):
+                priority = exp.priority ** self.config.priority_alpha
+                heapq.heappush(self.cold_priorities, (-priority, idx))
+
     def _evict_cold_experience(self):
         """Evict lowest priority experience from cold buffer"""
         if not self.cold_priorities:
             return
-        
-        # Remove lowest priority experience
+
         _, idx = heapq.heappop(self.cold_priorities)
-        
-        # Remove from buffer (swap with last element for efficiency)
+
         if idx < len(self.cold_buffer) - 1:
             self.cold_buffer[idx] = self.cold_buffer[-1]
-            # Update priority queue index
             for i, (_, buffer_idx) in enumerate(self.cold_priorities):
                 if buffer_idx == len(self.cold_buffer) - 1:
                     self.cold_priorities[i] = (self.cold_priorities[i][0], idx)
                     heapq.heapify(self.cold_priorities)
                     break
-        
+
         self.cold_buffer.pop()
-    
-    def sample_experiences(self, 
+
+    def sample_experiences(self,
                           batch_size: int,
                           temperature: float = 1.0,
-                          hot_ratio: float = 0.7) -> Tuple[List[Experience], List[float]]:
+                          hot_ratio: Optional[float] = None) -> Tuple[List[Experience], List[float]]:
         """
-        Sample experiences using softmax-weighted distribution
-        
-        Args:
-            batch_size: Number of experiences to sample
-            temperature: Temperature for softmax sampling
-            hot_ratio: Ratio of samples from hot buffer
-            
-        Returns:
-            (experiences, importance_weights): Sampled experiences and weights
+        Sample experiences using softmax-weighted distribution with PPO importance correction.
         """
         with self._lock:
             if len(self.hot_buffer) + len(self.cold_buffer) < self.config.min_experiences:
                 return [], []
-            
-            # Determine sample sizes
+
+            if hot_ratio is None:
+                hot_ratio = self.config.hot_sample_ratio
+
             hot_samples = int(batch_size * hot_ratio)
             cold_samples = batch_size - hot_samples
             
@@ -269,57 +275,43 @@ class HotColdBuffer:
             
             return all_experiences, all_weights
     
-    def _sample_from_buffer(self, 
+    def _sample_from_buffer(self,
                            buffer: List[Experience],
                            priorities: List[Tuple[float, int]],
                            sample_size: int,
                            temperature: float) -> Tuple[List[Experience], List[float]]:
-        """Sample experiences from a single buffer partition"""
+        """Sample from buffer using C++ softmax kernel when available."""
         if not buffer or sample_size == 0:
             return [], []
-        
-        # Get priorities
+
         buffer_priorities = []
+        valid_indices = []
         for _, idx in priorities:
             if idx < len(buffer):
                 buffer_priorities.append(buffer[idx].priority)
-        
+                valid_indices.append(idx)
+
         if not buffer_priorities:
             return [], []
-        
-        # Convert to numpy for softmax computation
-        priorities_array = np.array(buffer_priorities)
-        
-        # Apply temperature scaling
-        scaled_priorities = priorities_array / temperature
-        
-        # Compute softmax probabilities
-        exp_priorities = np.exp(scaled_priorities - np.max(scaled_priorities))
-        probabilities = exp_priorities / np.sum(exp_priorities)
-        
-        # Sample indices
-        indices = np.random.choice(
-            len(buffer_priorities), 
-            size=min(sample_size, len(buffer_priorities)),
-            replace=True,
-            p=probabilities
+
+        priorities_array = np.array(buffer_priorities, dtype=np.float32)
+        seed = int(time.time() * 1e6) % (2**63)
+        sampled_local, weights = priority_sample(
+            priorities_array,
+            min(sample_size, len(buffer_priorities)),
+            temperature,
+            self.config.importance_sampling_beta,
+            seed,
         )
-        
-        # Get experiences and compute importance weights
+
         experiences = []
-        weights = []
-        
-        for idx in indices:
-            buffer_idx = priorities[idx][1]
-            if buffer_idx < len(buffer):
-                experience = buffer[buffer_idx]
-                experiences.append(experience)
-                
-                # Importance sampling weight
-                importance_weight = (len(buffer) * probabilities[idx]) ** (-self.config.importance_sampling_beta)
-                weights.append(importance_weight)
-        
-        return experiences, weights
+        importance_weights = []
+        for local_idx, weight in zip(sampled_local, weights):
+            buffer_idx = valid_indices[int(local_idx)]
+            experiences.append(buffer[buffer_idx])
+            importance_weights.append(float(weight))
+
+        return experiences, importance_weights
     
     def update_priorities(self, indices: List[int], new_priorities: List[float]):
         """Update priorities for specific experiences"""
@@ -364,12 +356,11 @@ class PrioritizedReplayBuffer:
     - Importance sampling correction
     """
     
-    def __init__(self, config: ReplayConfig):
+    def __init__(self, config: ReplayConfig, latent_dim: int = 512):
         self.config = config
-        
-        # Core components
+
         self.hot_cold_buffer = HotColdBuffer(config)
-        self.surprise_calculator = SurpriseCalculator(config)
+        self.surprise_calculator = SurpriseCalculator(config, latent_dim=latent_dim)
         
         # Experience tracking
         self.total_experiences = 0
@@ -397,10 +388,8 @@ class PrioritizedReplayBuffer:
             done: Whether episode is done
         """
         with self._lock:
-            # Update trajectory statistics
-            self.surprise_calculator.update_statistics(latent_plan)
-            
-            # Compute surprise score
+            self.surprise_calculator.update_ema_plan(latent_plan)
+
             surprise_score = self.surprise_calculator.compute_surprise_score(
                 latent_plan, reward
             )
@@ -446,16 +435,17 @@ class PrioritizedReplayBuffer:
             )
     
     def update_experience_ages(self):
-        """Update age of all experiences (called each training step)"""
+        """Update ages, migrate hot→cold, and enforce bounded replay age."""
         with self._lock:
             self.experience_age_counter += 1
-            
-            # Update ages in both buffers
+
             for experience in self.hot_cold_buffer.hot_buffer:
                 experience.age += 1
-            
             for experience in self.hot_cold_buffer.cold_buffer:
                 experience.age += 1
+
+            self.hot_cold_buffer.migrate_aged_experiences()
+            self.hot_cold_buffer.evict_stale_experiences()
     
     def get_buffer_statistics(self) -> Dict[str, Any]:
         """Get comprehensive buffer statistics"""

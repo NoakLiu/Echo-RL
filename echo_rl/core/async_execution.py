@@ -22,7 +22,13 @@ import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-from abc import ABC, abstractmethod
+
+from ..kernels import (
+    attention_bandwidth_cost,
+    prefix_match,
+    schedule_priorities,
+    state_hash,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +77,8 @@ class ExecutionConfig:
     latency_weight: float = 0.1
     reward_weight: float = 1.0
     timeout: float = 30.0  # seconds per rollout
+    schedule_epsilon: float = 1e-6  # ε in priority(i) = r_i / (q_i + ε)
+    bandwidth_scale: float = 1.0  # scale for b(s_{1:t})
 
 class KVCacheManager:
     """
@@ -83,9 +91,10 @@ class KVCacheManager:
         self.config = config
         self.device = device
         
-        # Cache storage
+        # Cache storage: key -> entry, plus ordered hash index for prefix lookup
         self.cache: Dict[str, KVCacheEntry] = {}
-        self.access_order = deque()  # For LRU tracking
+        self.cache_hash_index: List[Tuple[int, str]] = []  # (hash, cache_key)
+        self.access_order = deque()
         
         # Cache statistics
         self.hit_count = 0
@@ -125,31 +134,45 @@ class KVCacheManager:
                 logger.debug(f"Removed cache entry: {key}")
     
     def get_cache_key(self, state_sequence: torch.Tensor) -> str:
-        """Generate cache key from state sequence"""
-        # Use hash of state sequence for key
-        state_hash = hash(state_sequence.cpu().numpy().tobytes())
-        return f"states_{state_hash}"
-    
+        """Generate cache key from state sequence prefix hash."""
+        state_np = state_sequence.detach().cpu().numpy().astype(np.float32)
+        if state_np.ndim == 2:
+            flat = state_np.reshape(-1)
+        else:
+            flat = state_np
+        return f"states_{state_hash(flat)}"
+
+    def _build_prefix_hashes(self, state_sequence: torch.Tensor) -> np.ndarray:
+        """Cumulative prefix hashes for longest-prefix KV reuse."""
+        seq = state_sequence.detach().cpu().numpy()
+        if seq.ndim == 1:
+            return np.array([state_hash(seq)], dtype=np.uint64)
+        hashes = []
+        for i in range(1, seq.shape[0] + 1):
+            prefix = seq[:i].reshape(-1).astype(np.float32)
+            hashes.append(state_hash(prefix))
+        return np.array(hashes, dtype=np.uint64)
+
     def find_longest_prefix(self, state_sequence: torch.Tensor) -> Optional[Tuple[str, int]]:
         """
-        Find the longest cached prefix of the state sequence
-        
-        Args:
-            state_sequence: [seq_len, state_dim] - input sequence
-            
-        Returns:
-            (cache_key, prefix_length) or None if no prefix found
+        Find longest cached prefix using C++ kernel.
+
+        KV(s_{1:t}) = KV_frozen(s_{1:t'}) ∪ KV_rolling(s_{t'+1:t})
         """
-        seq_len = state_sequence.shape[0]
-        
-        # Try progressively shorter prefixes
-        for prefix_len in range(seq_len - 1, 0, -1):
-            prefix = state_sequence[:prefix_len]
-            cache_key = self.get_cache_key(prefix)
-            
-            if cache_key in self.cache:
-                return cache_key, prefix_len
-        
+        if state_sequence.shape[0] <= 1 or not self.cache_hash_index:
+            return None
+
+        prefix_hashes = self._build_prefix_hashes(state_sequence)
+        cache_entries = [
+            (int(h), idx) for idx, (h, _) in enumerate(self.cache_hash_index)
+        ]
+        cache_index, prefix_len = prefix_match(prefix_hashes, cache_entries, min_prefix_len=1)
+        if cache_index < 0 or prefix_len <= 0:
+            return None
+
+        _, cache_key = self.cache_hash_index[cache_index]
+        if cache_key in self.cache:
+            return cache_key, prefix_len
         return None
     
     def get_kv_cache(self, state_sequence: torch.Tensor) -> Tuple[Optional[torch.Tensor], int]:
@@ -204,7 +227,11 @@ class KVCacheManager:
             
             # Store in cache
             self.cache[cache_key] = entry
-            
+            prefix_hash = int(state_hash(
+                state_sequence.detach().cpu().numpy().reshape(-1).astype(np.float32)
+            ))
+            self.cache_hash_index.append((prefix_hash, cache_key))
+
             # Manage cache size
             if len(self.cache) > self.config.max_cache_size:
                 self._evict_lru()
@@ -219,6 +246,9 @@ class KVCacheManager:
                      key=lambda k: self.cache[k].last_access)
         
         del self.cache[lru_key]
+        self.cache_hash_index = [
+            (h, k) for h, k in self.cache_hash_index if k != lru_key
+        ]
         logger.debug(f"Evicted LRU cache entry: {lru_key}")
     
     def get_cache_stats(self) -> Dict[str, Any]:
@@ -236,34 +266,29 @@ class KVCacheManager:
 
 class LatencyScheduler:
     """
-    Priority scheduler based on reward-cost ratio
-    
-    Implements: priority(i) = r_i / (q_i + ε)
-    where r_i is reward and q_i is estimated queue time
+    Reward-to-latency scheduler for async rollouts.
+
+    priority(i) = r_i / (q_i + ε)
     """
-    
+
     def __init__(self, config: ExecutionConfig):
         self.config = config
         self.priority_queue = []
-        self.request_times = {}  # Track when requests were submitted
-        self.estimated_times = {}  # Track estimated execution times
-        
-        # Thread safety
+        self.request_times = {}
+        self.estimated_times = {}
         self._lock = threading.RLock()
-    
+
     def add_request(self, request: RolloutRequest):
-        """Add request to priority queue"""
         with self._lock:
-            # Estimate queue time based on current queue length
-            queue_time = len(self.priority_queue) * 0.1  # Rough estimate
-            
-            # Compute priority: reward / (queue_time + epsilon)
-            priority = request.priority / (queue_time + 1e-6)
-            
-            # Store request info
+            queue_time = len(self.priority_queue) * 0.1
+            rewards = np.array([request.priority], dtype=np.float32)
+            queue_times = np.array([queue_time], dtype=np.float32)
+            priority_arr = schedule_priorities(
+                rewards, queue_times, self.config.schedule_epsilon
+            )
+            priority = float(priority_arr[0])
+
             self.request_times[request.request_id] = time.time()
-            
-            # Add to priority queue (negative for max-heap behavior)
             heapq.heappush(self.priority_queue, (-priority, request))
     
     def get_next_request(self) -> Optional[RolloutRequest]:
@@ -317,6 +342,7 @@ class AsyncExecutionEngine:
         # Performance tracking
         self.total_tokens_generated = 0
         self.total_execution_time = 0.0
+        self.total_bandwidth_cost = 0.0
         self.rollout_count = 0
         
         # Thread safety
@@ -393,11 +419,12 @@ class AsyncExecutionEngine:
             # Store updated KV cache
             self.kv_cache_manager.store_kv_cache(request.state_sequence, kv_states)
             
-            # Generate tokens using the model
             tokens_generated = self._generate_tokens(kv_states, request.state_sequence)
-            
+            seq_len = int(request.state_sequence.shape[0])
+            bandwidth_cost = attention_bandwidth_cost(seq_len, self.config.bandwidth_scale)
+
             execution_time = time.time() - start_time
-            
+
             result = RolloutResult(
                 request_id=request.request_id,
                 success=True,
@@ -407,8 +434,9 @@ class AsyncExecutionEngine:
                 metadata={
                     "reuse_length": reuse_length,
                     "cache_hit": cached_kv is not None,
-                    **request.metadata
-                }
+                    "bandwidth_cost": bandwidth_cost,
+                    **request.metadata,
+                },
             )
             
         except Exception as e:
@@ -428,6 +456,7 @@ class AsyncExecutionEngine:
             self.total_execution_time += execution_time
             if result.success:
                 self.total_tokens_generated += result.tokens_generated
+                self.total_bandwidth_cost += result.metadata.get("bandwidth_cost", 0.0)
             
             # Move from active to completed
             if request.request_id in self.active_rollouts:
@@ -524,10 +553,11 @@ class AsyncExecutionEngine:
                 "completed_rollouts": len(self.completed_rollouts),
                 "total_tokens_generated": self.total_tokens_generated,
                 "total_execution_time": self.total_execution_time,
+                "total_bandwidth_cost": self.total_bandwidth_cost,
                 "avg_execution_time": avg_execution_time,
                 "tokens_per_second": tokens_per_second,
                 "cache_stats": cache_stats,
-                "queue_stats": queue_stats
+                "queue_stats": queue_stats,
             }
     
     def shutdown(self):

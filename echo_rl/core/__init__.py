@@ -7,15 +7,17 @@ This module contains the three key innovations of EchoRL:
 3. Prioritized Replay Buffer
 """
 
-from .latent_planning import LatentPlanningOptimizer, TrajectoryEncoder
+from .latent_planning import LatentPlanningOptimizer, TrajectoryEncoder, SoftPrefixAdapter
 from .async_execution import AsyncExecutionEngine, KVCacheManager, LatencyScheduler
 from .prioritized_replay import PrioritizedReplayBuffer, HotColdBuffer, SurpriseCalculator
 from .ppo_learner import PPOLearner, GAECalculator, PolicyNetwork
+from .bandwidth import BandwidthEfficiencyTracker, BandwidthMetrics
 
 __all__ = [
     "LatentPlanningOptimizer",
     "TrajectoryEncoder",
-    "AsyncExecutionEngine", 
+    "SoftPrefixAdapter",
+    "AsyncExecutionEngine",
     "KVCacheManager",
     "LatencyScheduler",
     "PrioritizedReplayBuffer",
@@ -23,5 +25,7 @@ __all__ = [
     "SurpriseCalculator",
     "PPOLearner",
     "GAECalculator",
-    "PolicyNetwork"
+    "PolicyNetwork",
+    "BandwidthEfficiencyTracker",
+    "BandwidthMetrics",
 ]

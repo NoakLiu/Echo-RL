@@ -54,6 +54,10 @@ pip install -r requirements.txt
 
 # Install EchoRL in development mode
 pip install -e .
+
+# Build C++ performance kernels (optional but recommended)
+pip install pybind11
+pip install -e ".[dev]"  # or: python setup.py build_ext --inplace
 ```
 
 ### Optional Dependencies
@@ -126,7 +130,38 @@ async def main():
 asyncio.run(main())
 ```
 
-## Architecture
+## Architecture (Components)
+
+EchoRL coordinates three modules through one shared latent plan τ̄:
+
+```
+Latent Plan τ_t = F_φ(s_{t-k:t})
+        │
+        ├──► Soft-prefix policy π_θ(a_t | s_t, τ_t)
+        ├──► KV-aware async rollout scheduling: priority = r / (q + ε)
+        └──► Planning-aware replay: score = ||τ_t - τ̄||² + α|r_t|
+```
+
+### C++ Performance Kernels
+
+Performance-critical paths are implemented in C++ (`echo_rl/kernels/`) with Python fallbacks:
+
+| Kernel | Paper reference |
+|--------|-----------------|
+| `EMAPlanTracker` | Shared EMA plan τ̄ for replay scoring |
+| `plan_surprise` | \|\|τ_t - τ̄\|\|² + α\|r_t\| |
+| `prefix_match` | KV prefix reuse: KV(s₁:t) = KV_frozen ∪ KV_rolling |
+| `priority_sample` | Softmax replay sampling + importance weights |
+| `attention_bandwidth_cost` | Rollout bandwidth b(s₁:t) |
+| `bandwidth_efficiency` | η_bw learning return per bandwidth unit |
+
+Build kernels:
+
+```bash
+pip install pybind11
+python setup.py build_ext --inplace
+python -c "from echo_rl.kernels import kernels_available; print(kernels_available())"
+```
 
 EchoRL consists of three core components:
 

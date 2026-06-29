@@ -26,6 +26,7 @@ from ..core.latent_planning import LatentPlanningOptimizer, PlanningConfig, Traj
 from ..core.async_execution import AsyncExecutionEngine, ExecutionConfig, RolloutRequest
 from ..core.prioritized_replay import PrioritizedReplayBuffer, ReplayConfig, Experience
 from ..core.ppo_learner import PPOLearner, PPOConfig, PPOTrainingStep
+from ..core.bandwidth import BandwidthEfficiencyTracker
 from ..environments.base import EchoRLEnvironment, EnvironmentState
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ class TrainingMetrics:
     kl_divergences: List[float] = field(default_factory=list)
     entropy_losses: List[float] = field(default_factory=list)
     kv_cache_hit_rates: List[float] = field(default_factory=list)
+    bandwidth_efficiency: List[float] = field(default_factory=list)
     replay_buffer_stats: Dict[str, Any] = field(default_factory=dict)
     execution_metrics: Dict[str, Any] = field(default_factory=dict)
     
@@ -134,6 +136,10 @@ class EchoRLTrainer:
         # Training buffers
         self.episode_buffer = []
         self.training_buffer = []
+        self.state_history: deque = deque(maxlen=64)
+
+        # Bandwidth efficiency tracker (η_bw)
+        self.bandwidth_tracker = BandwidthEfficiencyTracker()
         
         logger.info("EchoRL Trainer initialized successfully")
     
@@ -163,7 +169,8 @@ class EchoRLTrainer:
         
         # Prioritized Replay Buffer
         self.replay_buffer = PrioritizedReplayBuffer(
-            config=self.config.replay_config
+            config=self.config.replay_config,
+            latent_dim=self.config.planning_config.embedding_dim,
         )
         
         # PPO Learner
@@ -195,6 +202,10 @@ class EchoRLTrainer:
             from ..environments.arc import ARCEnvironment, ARCConfig
             env_config = ARCConfig(**self.config.env_config)
             return ARCEnvironment(env_config)
+        elif self.config.env_name == "game24":
+            from ..environments.game24 import Game24Environment, Game24Config
+            env_config = Game24Config(**self.config.env_config)
+            return Game24Environment(env_config)
         elif self.config.env_name == "minigrid":
             from ..environments.minigrid import MiniGridEnvironment, MiniGridConfig
             env_config = MiniGridConfig(**self.config.env_config)
@@ -338,32 +349,40 @@ class EchoRLTrainer:
                 next_state=self.env.get_state_representation(),
                 done=next_state.done,
                 timestamp=time.time(),
-                surprise_score=self.planning_optimizer.get_trajectory_surprise(trajectory_prior)
+                surprise_score=self.planning_optimizer.get_trajectory_surprise(
+                    trajectory_prior, next_state.reward
+                ),
             )
             
             trajectory.append(experience)
-            
+            self.bandwidth_tracker.record_rollout_step(
+                next_state.reward, seq_len=len(self.state_history) + 1
+            )
+            self.state_history.append(state)
+
             if next_state.done:
                 break
-        
+
         return trajectory
-    
+
     def _create_state_window(self, current_state: torch.Tensor) -> torch.Tensor:
-        """Create state window for trajectory encoding"""
-        # Simplified state window creation
-        # In practice, this would maintain a history of states
-        
+        """Create sliding state window s_{t-k:t} for trajectory encoding."""
+        self.state_history.append(current_state)
         window_size = self.config.planning_config.state_window_size
-        state_dim = current_state.shape[0]
-        
-        # Create state window (repeat current state for simplicity)
-        state_window = current_state.unsqueeze(0).repeat(window_size + 1, 1)
-        
-        return state_window
+
+        history = list(self.state_history)
+        if len(history) <= window_size + 1:
+            pad_count = window_size + 1 - len(history)
+            pad = [history[0]] * pad_count if history else [current_state]
+            window = pad + history
+        else:
+            window = history[-(window_size + 1):]
+
+        return torch.stack(window)
     
     async def _update_models(self):
         """Update models using collected experience"""
-        if len(self.replay_buffer.total_experiences) < self.config.batch_size:
+        if self.replay_buffer.total_experiences < self.config.batch_size:
             return
         
         # Sample batch from replay buffer
@@ -379,6 +398,15 @@ class EchoRLTrainer:
         
         # Update PPO learner
         ppo_metrics = self.ppo_learner.update(training_step)
+
+        weighted_pg = ppo_metrics["policy_loss"] * (
+            training_step.importance_weights.mean().item()
+            if training_step.importance_weights is not None
+            else 1.0
+        )
+        self.bandwidth_tracker.record_learner_update(weighted_pg)
+        bw_snapshot = self.bandwidth_tracker.snapshot()
+        self.metrics.bandwidth_efficiency.append(bw_snapshot.eta_bw)
         
         # Update planning optimizer
         planning_metrics = await self._update_planning_optimizer(experiences)
@@ -539,6 +567,9 @@ class EchoRLTrainer:
         # Update execution metrics
         exec_metrics = self.execution_engine.get_performance_metrics()
         self.metrics.execution_metrics = exec_metrics
+        self.metrics.kv_cache_hit_rates.append(
+            exec_metrics.get("cache_stats", {}).get("hit_rate", 0.0)
+        )
         
         # Update replay buffer metrics
         buffer_stats = self.replay_buffer.get_buffer_statistics()

@@ -18,7 +18,8 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 import logging
-from abc import ABC, abstractmethod
+
+from ..kernels import EMAPlanTracker, temporal_kl, temporal_kl_batch
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +37,14 @@ class PlanningConfig:
     """Configuration for latent planning optimization"""
     embedding_dim: int = 512
     state_window_size: int = 8  # k in the paper
-    kl_weight: float = 0.1  # λ_KL
+    kl_weight: float = 0.1  # λ_KL temporal regularization
+    ema_decay: float = 0.99  # decay for shared EMA plan τ̄
+    soft_prefix_alpha: float = 0.5  # blend weight for soft-prefix adapter
     lipschitz_constant: float = 1.0
     noise_std: float = 0.01
     learning_rate: float = 3e-4
     max_grad_norm: float = 1.0
+    discount_gamma: float = 1.0  # γ in Eq. (3)
 
 class TrajectoryEncoder(nn.Module):
     """
@@ -130,33 +134,35 @@ class TrajectoryEncoder(nn.Module):
         
         return latent_plan
     
-    def compute_kl_divergence(self, 
+    def compute_kl_divergence(self,
                               current_plan: torch.Tensor,
                               previous_plan: torch.Tensor) -> torch.Tensor:
         """
-        Compute KL divergence between consecutive trajectory priors
-        
-        Implements: L_KL = D_KL[p_φ(τ_t | s_{1:t}) || p_φ(τ_{t-1} | s_{1:t-1})]
-        
-        Args:
-            current_plan: [batch_size, embedding_dim] - τ_t
-            previous_plan: [batch_size, embedding_dim] - τ_{t-1}
-            
-        Returns:
-            kl_divergence: [batch_size] - KL divergence values
+        Temporal KL regularization between consecutive latent plans.
+
+        L_KL = D_KL[p_φ(τ_t | s_{1:t}) || p_φ(τ_{t-1} | s_{1:t-1})]
+             = ||τ_t - τ_{t-1}||² / (2σ²)
         """
-        # Treat latent plans as Gaussian distributions
-        # Current plan: N(τ_t, σ²I)
-        # Previous plan: N(τ_{t-1}, σ²I)
-        
         sigma_squared = self.config.noise_std ** 2
-        
-        # KL divergence between two Gaussians
-        # D_KL(N(μ₁, σ²I) || N(μ₂, σ²I)) = ||μ₁ - μ₂||² / (2σ²)
         diff = current_plan - previous_plan
         kl_div = torch.sum(diff ** 2, dim=-1) / (2 * sigma_squared)
-        
         return kl_div
+
+    def compute_kl_divergence_fast(self,
+                                   current_plan: torch.Tensor,
+                                   previous_plan: torch.Tensor) -> torch.Tensor:
+        """C++-accelerated temporal KL when batch is on CPU."""
+        sigma_squared = self.config.noise_std ** 2
+        if current_plan.device.type != "cpu":
+            return self.compute_kl_divergence(current_plan, previous_plan)
+
+        current_np = current_plan.detach().numpy()
+        previous_np = previous_plan.detach().numpy()
+        if current_np.ndim == 1:
+            kl_val = temporal_kl(current_np, previous_np, sigma_squared)
+            return torch.tensor([kl_val], dtype=current_plan.dtype)
+        kl_vals = temporal_kl_batch(current_np, previous_np, sigma_squared)
+        return torch.from_numpy(kl_vals).to(dtype=current_plan.dtype)
     
     def get_lipschitz_bound(self) -> float:
         """Estimate Lipschitz constant of the encoder"""
@@ -171,10 +177,33 @@ class TrajectoryEncoder(nn.Module):
         
         return total_bound
 
+class SoftPrefixAdapter(nn.Module):
+    """
+    Soft-prefix adapter blending state prefix with latent plan τ_t.
+
+    Implements the paper's soft-prefix conditioning:
+    h_t = α · W_s s_t + (1 - α) · W_τ τ_t
+    """
+
+    def __init__(self, state_dim: int, latent_dim: int, hidden_dim: int, alpha: float = 0.5):
+        super().__init__()
+        self.alpha = alpha
+        self.state_proj = nn.Linear(state_dim, hidden_dim)
+        self.latent_proj = nn.Linear(latent_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, state: torch.Tensor, latent_plan: torch.Tensor) -> torch.Tensor:
+        blended = (
+            self.alpha * self.state_proj(state)
+            + (1.0 - self.alpha) * self.latent_proj(latent_plan)
+        )
+        return self.norm(blended)
+
+
 class PolicyNetwork(nn.Module):
     """
-    Policy network that conditions on both state and latent plan
-    
+    Policy network conditioned on state and latent plan via soft-prefix adapter.
+
     Implements: π_θ(a_t | s_t, τ_t)
     """
     
@@ -183,57 +212,27 @@ class PolicyNetwork(nn.Module):
                  action_dim: int,
                  latent_dim: int,
                  hidden_dim: int = 512,
+                 soft_prefix_alpha: float = 0.5,
                  device: str = "cuda"):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.latent_dim = latent_dim
         self.device = device
-        
-        # State and latent plan processing
-        self.state_encoder = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+
+        self.soft_prefix = SoftPrefixAdapter(
+            state_dim, latent_dim, hidden_dim, alpha=soft_prefix_alpha
         )
-        
-        self.latent_encoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        
-        # Combined processing
-        self.combined_processor = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
+        self.action_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim)
+            nn.Linear(hidden_dim, action_dim),
         )
-        
+
     def forward(self, state: torch.Tensor, latent_plan: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of policy network
-        
-        Args:
-            state: [batch_size, state_dim] - current state s_t
-            latent_plan: [batch_size, latent_dim] - trajectory prior τ_t
-            
-        Returns:
-            logits: [batch_size, action_dim] - action logits
-        """
-        # Encode state and latent plan
-        state_repr = self.state_encoder(state)
-        latent_repr = self.latent_encoder(latent_plan)
-        
-        # Combine representations
-        combined = torch.cat([state_repr, latent_repr], dim=-1)
-        
-        # Generate action logits
-        logits = self.combined_processor(combined)
-        
-        return logits
+        """π_θ(a_t | s_t, τ_t) via soft-prefix adapter."""
+        conditioned = self.soft_prefix(state, latent_plan)
+        return self.action_head(conditioned)
     
     def get_action_probs(self, state: torch.Tensor, latent_plan: torch.Tensor) -> torch.Tensor:
         """Get action probabilities from policy"""
@@ -272,8 +271,17 @@ class LatentPlanningOptimizer:
         
         # Initialize networks
         self.trajectory_encoder = TrajectoryEncoder(state_dim, config, device)
-        self.policy_network = PolicyNetwork(state_dim, action_dim, config.embedding_dim, device=device)
-        
+        self.policy_network = PolicyNetwork(
+            state_dim,
+            action_dim,
+            config.embedding_dim,
+            soft_prefix_alpha=config.soft_prefix_alpha,
+            device=device,
+        )
+
+        # Shared EMA plan τ̄ coordinating replay and scheduling
+        self.ema_plan_tracker = EMAPlanTracker(config.embedding_dim, decay=config.ema_decay)
+
         # Optimizers
         self.encoder_optimizer = torch.optim.Adam(
             self.trajectory_encoder.parameters(),
@@ -301,15 +309,20 @@ class LatentPlanningOptimizer:
         """
         with torch.no_grad():
             latent_plan = self.trajectory_encoder(state_window)
-            
-            # Add noise for exploration
+
             noise = torch.randn_like(latent_plan) * self.config.noise_std
             latent_plan = latent_plan + noise
-            
+
+            # Update shared EMA plan τ̄
+            for i in range(latent_plan.shape[0]):
+                self.ema_plan_tracker.update(
+                    latent_plan[i].detach().cpu().numpy()
+                )
+
             return TrajectoryPrior(
                 latent_plan=latent_plan,
                 state_window=state_window,
-                timestamp=self.training_step
+                timestamp=self.training_step,
             )
     
     def compute_planning_loss(self,
@@ -410,27 +423,30 @@ class LatentPlanningOptimizer:
         
         return metrics
     
-    def get_trajectory_surprise(self, trajectory_prior: TrajectoryPrior) -> float:
+    def get_trajectory_surprise(self,
+                                trajectory_prior: TrajectoryPrior,
+                                reward: float = 0.0) -> float:
         """
-        Compute surprise score for trajectory prioritization
-        
-        Implements: score(t) = ||τ_t - E[τ]||² + α * r_t
-        
-        Args:
-            trajectory_prior: TrajectoryPrior object
-            
-        Returns:
-            surprise_score: Surprise score for replay prioritization
+        Plan surprise relative to EMA plan τ̄: ||τ_t - τ̄||² + α|r_t|
         """
-        # Compute distance from expected trajectory
+        from ..kernels import plan_surprise
+
         latent_plan = trajectory_prior.latent_plan
-        
-        # For now, use simple L2 norm as surprise metric
-        # In practice, this would be computed against a running average
-        surprise_score = torch.norm(latent_plan).item()
-        
+        plan_np = latent_plan.detach().cpu().numpy().reshape(-1)
+        ema_np = self.ema_plan_tracker.get_ema()
+        surprise_score = plan_surprise(
+            plan_np,
+            ema_np,
+            reward,
+            surprise_weight=1.0,
+            reward_weight=self.config.kl_weight,
+        )
         trajectory_prior.surprise_score = surprise_score
         return surprise_score
+
+    def get_ema_plan(self) -> np.ndarray:
+        """Return the shared EMA latent plan τ̄."""
+        return self.ema_plan_tracker.get_ema()
     
     def save_checkpoint(self, filepath: str):
         """Save model checkpoint"""
