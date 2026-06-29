@@ -105,7 +105,7 @@ def test_bandwidth_aware_priorities_kernel():
     bandwidth = np.array([4.0, 2.0], dtype=np.float32)
     queue = np.array([1.0, 1.0], dtype=np.float32)
     priorities = bandwidth_aware_priorities(rewards, bandwidth, queue)
-    assert priorities[0] == priorities[1]  # 2/(4+1) == 1/(2+1)
+    assert priorities[0] > priorities[1]  # 2/(4+1) > 1/(2+1)
 
 
 def test_state_hash_deterministic():

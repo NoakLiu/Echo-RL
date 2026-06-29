@@ -1,0 +1,10 @@
+Metadata-Version: 2.1
+Name: echo-rl
+Version: 1.1.0
+Summary: EchoRL: Bandwidth-Efficient RL with Latent Planning
+Requires-Python: >=3.9
+Requires-Dist: torch>=2.0.0
+Requires-Dist: numpy>=1.24.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21.0; extra == "dev"
