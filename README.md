@@ -257,26 +257,6 @@ experiences, weights = replay_buffer.sample_batch(
 )
 ```
 
-## Performance Results
-
-EchoRL achieves significant improvements across all evaluated tasks:
-
-| Task | Method | Success@1 (%) | ETPS | Cost/Success |
-|------|--------|---------------|------|---------------|
-| **ALFWorld** | ReAct | 58.3 | 1,234 | $0.041 |
-| | EchoRL | **73.1** | **2,721** | **$0.027** |
-| **WebShop** | ReAct | 58.3 | 1,234 | $0.041 |
-| | EchoRL | **73.1** | **2,721** | **$0.027** |
-| **CRUXEval** | ReAct | 58.3 | 1,234 | $0.041 |
-| | EchoRL | **73.1** | **2,721** | **$0.027** |
-
-### Key Improvements
-
-- **30-55% fewer environment steps** through trajectory-conditioned actions
-- **1.5-2.3× ETPS increase** via KV-cache sharing and token-level dispatch
-- **22-41% cost reduction** through prioritized replay system
-- **78% KV reuse rate** with prefix caching strategy
-
 ## Supported Tasks
 
 ### ALFWorld
